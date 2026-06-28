@@ -4,3 +4,4 @@ app.asar
 *.log
 
 .vercel
+.env*

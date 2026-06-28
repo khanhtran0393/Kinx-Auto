@@ -29,7 +29,15 @@ export default async function handler(req, res) {
     // Thông thường sẽ là email và password, hoặc username và password
     let body = req.body || {};
     if (typeof body === 'string') {
-        try { body = JSON.parse(body); } catch(e) {}
+        try { 
+            body = JSON.parse(body); 
+        } catch(e) {
+            // Thử parse URL-encoded
+            try {
+                const urlParams = new URLSearchParams(body);
+                body = Object.fromEntries(urlParams);
+            } catch(e2) {}
+        }
     }
 
     const email = body.email || body.username || body.user;
