@@ -43,3 +43,36 @@ VALUES
     ('anthropic', 'YOUR_ANTHROPIC_API_KEY_HERE'),
     ('elevenlabs', 'YOUR_ELEVENLABS_API_KEY_HERE')
 ON CONFLICT (platform) DO NOTHING;
+
+-- 5. Tạo bảng users để quản lý tài khoản đăng nhập Kinx Auto
+CREATE TABLE IF NOT EXISTS public.users (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    email TEXT UNIQUE NOT NULL,
+    password TEXT NOT NULL,
+    role TEXT DEFAULT 'user',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
+);
+
+-- Thiết lập bảo mật RLS cho bảng users
+ALTER TABLE public.users ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Enable all access for service_role only" 
+ON public.users 
+FOR ALL 
+TO service_role 
+USING (true) 
+WITH CHECK (true);
+
+-- Trigger cập nhật updated_at cho users
+CREATE TRIGGER handle_updated_at_users
+    BEFORE UPDATE ON public.users
+    FOR EACH ROW
+    EXECUTE PROCEDURE public.handle_updated_at();
+
+-- Khởi tạo sẵn một tài khoản Admin mặc định
+INSERT INTO public.users (email, password, role)
+VALUES 
+    ('admin@kinxauto.com', '123456', 'admin')
+ON CONFLICT (email) DO NOTHING;
+
