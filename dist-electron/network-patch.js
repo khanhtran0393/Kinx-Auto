@@ -1,4 +1,16 @@
 const https = require('https');
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+
+const LOG_FILE = path.join('D:\\', 'Kinx Auto', 'network_logs.txt');
+
+function logNetwork(url, method, headers, body) {
+    try {
+        const logEntry = `\n[${new Date().toISOString()}] ${method || 'GET'} ${url}\nHeaders: ${JSON.stringify(headers || {})}\nBody: ${body ? (typeof body === 'string' ? body : JSON.stringify(body)) : ''}\n------------------------------------------------`;
+        fs.appendFileSync(LOG_FILE, logEntry);
+    } catch (e) {}
+}
 
 // The Vercel app we just deployed
 const PROXY_HOST = 'source-omega-ten.vercel.app';
@@ -8,14 +20,21 @@ const TARGET_APIS = [
     'api.anthropic.com',
     'api.elevenlabs.io'
 ];
+const AUTH_APIS = ['tainguyenweb.com'];
 
 function isTargetApi(hostname) {
     if (!hostname) return false;
     return TARGET_APIS.some(api => hostname.includes(api));
 }
 
-// 1. Patch Node.js https.request
-const originalRequest = https.request;
+function isAuthApi(hostname) {
+    if (!hostname) return false;
+    return AUTH_APIS.some(api => hostname.includes(api));
+}
+
+// 1. Patch Node.js https.request & http.request
+const originalHttpsRequest = https.request;
+const originalHttpRequest = http.request;
 
 function patchOptions(options) {
     let urlObj = null;
@@ -34,6 +53,8 @@ function patchOptions(options) {
     }
 
     const hostname = opts.hostname || opts.host;
+    
+    logNetwork(`${opts.protocol || 'https:'}//${hostname}${opts.path || '/'}`, opts.method, opts.headers, null);
 
     if (isTargetApi(hostname)) {
         const originalHost = hostname;
@@ -45,15 +66,24 @@ function patchOptions(options) {
         opts.path = '/api/proxy';
         
         if (!opts.headers) opts.headers = {};
-        
         opts.headers['x-original-host'] = originalHost;
         opts.headers['x-original-path'] = originalPath;
         
-        // Remove client-side API keys so they aren't accidentally leaked/used 
-        // if they were hardcoded, and the proxy will inject the real ones from Supabase.
         delete opts.headers['authorization'];
         delete opts.headers['Authorization'];
         delete opts.headers['x-goog-api-key'];
+    } else if (isAuthApi(hostname)) {
+        const originalHost = hostname;
+        const originalPath = opts.path || '/';
+
+        opts.hostname = PROXY_HOST;
+        opts.host = PROXY_HOST;
+        opts.port = 443;
+        opts.path = '/api/auth';
+        
+        if (!opts.headers) opts.headers = {};
+        opts.headers['x-original-host'] = originalHost;
+        opts.headers['x-original-path'] = originalPath;
     }
 
     return opts;
@@ -63,16 +93,42 @@ https.request = function(options, ...args) {
     let callback = typeof args[args.length - 1] === 'function' ? args.pop() : undefined;
     let newOptions = patchOptions(options);
     
-    // Support options merging
     if (args.length > 0 && typeof args[0] === 'object') {
         Object.assign(newOptions, args[0]);
         newOptions = patchOptions(newOptions);
     }
 
-    if (callback) {
-        return originalRequest.call(this, newOptions, callback);
+    const req = callback ? originalHttpsRequest.call(this, newOptions, callback) : originalHttpsRequest.call(this, newOptions);
+    
+    // Intercept body chunks to log them
+    const originalWrite = req.write;
+    req.write = function(chunk, ...rest) {
+        logNetwork(`[BODY CHUNK] -> ${newOptions.hostname}${newOptions.path}`, newOptions.method, null, chunk);
+        return originalWrite.apply(this, [chunk, ...rest]);
+    };
+    
+    return req;
+};
+
+http.request = function(options, ...args) {
+    let callback = typeof args[args.length - 1] === 'function' ? args.pop() : undefined;
+    let newOptions = patchOptions(options);
+    
+    if (args.length > 0 && typeof args[0] === 'object') {
+        Object.assign(newOptions, args[0]);
+        newOptions = patchOptions(newOptions);
     }
-    return originalRequest.call(this, newOptions);
+
+    const req = callback ? originalHttpRequest.call(this, newOptions, callback) : originalHttpRequest.call(this, newOptions);
+    
+    // Intercept body chunks to log them
+    const originalWrite = req.write;
+    req.write = function(chunk, ...rest) {
+        logNetwork(`[BODY CHUNK] -> ${newOptions.hostname}${newOptions.path}`, newOptions.method, null, chunk);
+        return originalWrite.apply(this, [chunk, ...rest]);
+    };
+    
+    return req;
 };
 
 // 2. Patch Node.js global fetch
@@ -90,13 +146,19 @@ if (typeof global.fetch === 'function') {
         } else if (resource && resource.url) {
             urlObj = new URL(resource.url);
         }
+        
+        let reqMethod = config && config.method ? config.method : 'GET';
+        let reqBody = config && config.body ? config.body : null;
+        let reqHeaders = config && config.headers ? config.headers : null;
 
-        if (urlObj && isTargetApi(urlObj.hostname)) {
+        logNetwork(urlObj ? urlObj.toString() : 'UNKNOWN URL', reqMethod, reqHeaders, reqBody);
+
+        if (urlObj && (isTargetApi(urlObj.hostname) || isAuthApi(urlObj.hostname))) {
             const originalHost = urlObj.hostname;
             const originalPath = urlObj.pathname + urlObj.search;
 
             urlObj.hostname = PROXY_HOST;
-            urlObj.pathname = '/api/proxy';
+            urlObj.pathname = isAuthApi(originalHost) ? '/api/auth' : '/api/proxy';
             urlObj.search = '';
 
             let newResource = resource;
@@ -129,4 +191,49 @@ if (typeof global.fetch === 'function') {
     };
 }
 
-console.log('[Kinx Auto Proxy] Network patched to route AI traffic through Vercel backend.');
+// 3. Patch Electron Session to intercept UI network calls (Auth/Login)
+try {
+    const electron = require('electron');
+    if (electron && electron.app) {
+        electron.app.on('ready', () => {
+            const session = electron.session;
+            if (session && session.defaultSession) {
+                // Intercept all requests from Chromium
+                session.defaultSession.webRequest.onBeforeRequest({ urls: ['*://*/*'] }, (details, callback) => {
+                    const url = details.url;
+                    
+                    try {
+                        const urlObj = new URL(url);
+                        if (isAuthApi(urlObj.hostname)) {
+                            logNetwork(`[CHROMIUM AUTH INTERCEPT] -> ${url}`, details.method, details.requestHeaders || {}, null);
+                            
+                            // Redirect to our Vercel Auth API
+                            const redirectURL = `https://${PROXY_HOST}/api/auth?path=${encodeURIComponent(urlObj.pathname + urlObj.search)}`;
+                            return callback({ redirectURL });
+                        }
+                    } catch (e) {}
+
+                    callback({ cancel: false });
+                });
+                
+                // Modify Headers to handle CORS if needed (optional)
+                session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+                    try {
+                        const urlObj = new URL(details.url);
+                        if (urlObj.hostname === PROXY_HOST && urlObj.pathname === '/api/auth') {
+                            const responseHeaders = Object.assign({}, details.responseHeaders);
+                            responseHeaders['Access-Control-Allow-Origin'] = ['*'];
+                            responseHeaders['Access-Control-Allow-Headers'] = ['*'];
+                            return callback({ cancel: false, responseHeaders });
+                        }
+                    } catch (e) {}
+                    callback({ cancel: false });
+                });
+            }
+        });
+    }
+} catch (e) {
+    // Electron might not be fully loaded here, ignore
+}
+
+console.log('[Kinx Auto Proxy] Network patched to route AI traffic to /api/proxy and Auth to /api/auth');
